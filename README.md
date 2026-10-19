@@ -4,7 +4,7 @@
 
 # 🍰 CakeAgent
 
-[![Build](https://github.com/kossov-it/cakeagent/actions/workflows/build.yml/badge.svg)](https://github.com/kossov-it/cakeagent/actions/workflows/build.yml)
+[![Build](https://github.com/k-it-ai/cakeagent/actions/workflows/build.yml/badge.svg)](https://github.com/k-it-ai/cakeagent/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A personal AI agent you can actually read — around 3,300 lines of code, 9 files, and 3 runtime dependencies.
@@ -40,13 +40,13 @@ Linux server with Node.js 18+ required.
 **Quick install:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kossov-it/cakeagent/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/k-it-ai/cakeagent/main/install.sh | sudo bash
 ```
 
 **Or manually:**
 
 ```bash
-git clone https://github.com/kossov-it/cakeagent.git
+git clone https://github.com/k-it-ai/cakeagent.git
 cd cakeagent
 sudo bash setup.sh
 ```
