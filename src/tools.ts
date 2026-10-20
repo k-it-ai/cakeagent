@@ -250,8 +250,9 @@ function htmlToText(html: string): string {
   // Order: strip scripts/styles → strip tags → decode entities (once, longest-first).
   let text = html;
   // Remove <script>...</script> and <style>...</style> blocks
-  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ');
-  text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+  // Tolerant end tags: allow whitespace around </ and tag name (e.g., </ script >, </script >)
+  text = text.replace(/<script\b[^>]*>[\s\S]*?<\s*\/\s*script\b[^>]*>/gi, ' ');
+  text = text.replace(/<style\b[^>]*>[\s\S]*?<\s*\/\s*style\b[^>]*>/gi, ' ');
   // Remove remaining tags — robust pattern handles attributes with >, comments, etc.
   // Not a security sanitizer; input is from validated URLs via safeFetch().
   // This regex handles: normal tags, attributes with quoted >, <!-- comments -->, <!DOCTYPE>, <?xml?>.
