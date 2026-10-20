@@ -1,0 +1,25 @@
+name: "CakeAgent CodeQL Config"
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+paths-ignore:
+  - "node_modules"
+  - "dist"
+  - "coverage"
+  - "tests"
+  - "*.test.ts"
+  - "setup.sh"
+  - "whisper.cpp"
+
+# Custom rules to reduce noise
+rule-paths:
+  - .
+
+# Disable rules that are too noisy for this codebase
+disable-rules:
+  - id: "js/redundant-assignment"
+    reason: "Common in TypeScript"
+  - id: "js/useless-comparison"
+    reason: "Defensive coding patterns"

@@ -270,8 +270,10 @@ const BASH_DENY = [
 
   // Destructive operations
   /;\s*rm\s+-rf?\s/,                   // chained destructive rm
-  /\brm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)*(?:\/|~|\$HOME)(?:\s|$)/,
-  /\brm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)*\/(?:usr|var|etc|opt|home|root|bin|sbin|lib|boot|dev|proc|sys)(?:\s|$)/,
+  // rm -rf / or rm -rf ~ or rm -rf $HOME (no catastrophic backtracking)
+  /\brm\s+(?:-[a-zA-Z]*\s+)*(?:-rf|-fr)\s+(?:\/|~|\$HOME)(?:\s|$)/,
+  // rm -rf /usr, /var, /etc, etc. (no catastrophic backtracking)
+  /\brm\s+(?:-[a-zA-Z]*\s+)*(?:-rf|-fr)\s+\/(?:usr|var|etc|opt|home|root|bin|sbin|lib|boot|dev|proc|sys)(?:\s|$)/,
   /\bdd\b.*\bof=/,                     // disk write
   /\/dev\/(?:fd|mem|kmem|port)(?:\/|\s|$)/,
 
