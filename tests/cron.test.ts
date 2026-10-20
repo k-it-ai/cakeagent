@@ -98,13 +98,20 @@ test('cron: computeNextCronRun with DOM+DOW both constrained uses OR', () => {
   assert.ok(next!.getTime() < new Date(2026, 4, 2).getTime());
 });
 
-test('cron: bounded at 366 days (returns null for impossible expressions)', () => {
+test('cron: returns null for impossible expressions', () => {
   // Feb 30 doesn't exist — should never match.
-  // But parseCronExpression accepts dom=30 and month=2, so computeNextCronRun
-  // must give up after 366 days.
   const f = parseCronExpression('0 0 30 2 *')!;
   const next = computeNextCronRun(f, new Date(2026, 0, 1));
   assert.equal(next, null);
+});
+
+test('cron: finds February 29 across a leap-year gap', () => {
+  const f = parseCronExpression('0 0 29 2 *')!;
+  const next = computeNextCronRun(f, new Date(2025, 2, 1));
+  assert.ok(next);
+  assert.equal(next!.getMonth(), 1);
+  assert.equal(next!.getDate(), 29);
+  assert.equal(next!.getFullYear(), 2028);
 });
 
 test('cronToHuman: daily', () => {

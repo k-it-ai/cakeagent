@@ -1,12 +1,12 @@
 // Minimal cron expression parsing and next-run calculation.
-// Supports standard 5-field expressions (minute hour day month weekday).
 //
-// Supports the standard 5-field cron subset:
+// Supports the standard 5-field subset:
 //   minute hour day-of-month month day-of-week
 //
-// Field syntax: wildcard, N, step (star-slash-N), range (N-M), list (N,M,...).
-// No L, W, ?, or name aliases. All times are interpreted in the process's
-// local timezone — "0 9 * * *" means 9am wherever the server is running.
+// Field syntax: wildcard, N, star-slash-N step, N-M range, N-M/S range step,
+// and comma lists. Month/weekday names and @nicknames are accepted. No L, W,
+// or ?. All times are interpreted in the process's local timezone — "0 9 * * *"
+// means 9am wherever the server is running.
 
 export type CronFields = {
   minute: number[];
@@ -141,7 +141,9 @@ export function parseCronExpression(expr: string): CronFields | null {
 
 /**
  * Compute the next Date strictly after `from` that matches the cron fields,
- * using the process's local timezone. Bounded at 366 days.
+ * using the process's local timezone. The search bound is eight years so
+ * sparse-but-valid expressions such as February 29 (up to an 8-year gap
+ * across non-leap century years) are still found.
  *
  * Standard cron semantics: when both dayOfMonth and dayOfWeek are constrained
  * (neither is the full range), a date matches if EITHER matches.
@@ -164,7 +166,7 @@ export function computeNextCronRun(
   t.setSeconds(0, 0);
   t.setMinutes(t.getMinutes() + 1);
 
-  const maxIter = 366 * 24 * 60;
+  const maxIter = 8 * 366 * 24 * 60;
   for (let i = 0; i < maxIter; i++) {
     const month = t.getMonth() + 1;
     if (!monthSet.has(month)) {

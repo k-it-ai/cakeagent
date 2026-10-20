@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=cakeagent
 Group=cakeagent
 WorkingDirectory=/opt/cakeagent
@@ -12,13 +12,21 @@ ExecStart=/usr/bin/node dist/src/index.js
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
+# Watchdog: if the process doesn't send a keep-alive ping within 60s,
+# systemd will restart it. The agent sends READY=1 at startup and
+# WATCHDOG=1 periodically via sd_notify.
+WatchdogSec=60
 
 EnvironmentFile=/opt/cakeagent/.env
 
-# Filesystem: strict read-only baseline, scoped write access
+# Filesystem: strict read-only baseline. The agent is explicitly an
+# administrative assistant, so package/service/config management needs write
+# access to the usual system trees. Those writes still require sudo/root
+# ownership; the cakeagent user only owns /opt/cakeagent. Do not list
+# /etc/sudoers or /etc/shadow in InaccessiblePaths: sudo must be able to read
+# its policy, and hiding those paths breaks the scoped sudoers model.
 ProtectSystem=strict
 ReadWritePaths=/opt/cakeagent /usr /var /etc
-InaccessiblePaths=/etc/shadow /etc/gshadow /etc/sudoers /etc/sudoers.d /etc/ssh
 
 # Isolation
 ProtectHome=true
@@ -32,10 +40,14 @@ ProtectHostname=true
 ProtectProc=invisible
 LockPersonality=true
 RestrictRealtime=true
-RestrictNamespaces=true
+# Rootless Podman requires user, mount, pid, net, uts, ipc and cgroup
+# namespaces. Restricting them makes the documented container workflow fail,
+# so namespace isolation is provided by Podman's rootless user namespace
+# rather than by systemd here.
+RestrictNamespaces=false
 # AF_NETLINK required so agent-invoked nft/iptables/ip route can speak to the
 # kernel (netfilter, routing). Without it, sudoers-allowed firewall tools fail.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_INET AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 UMask=0077
 RemoveIPC=true

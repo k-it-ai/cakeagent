@@ -1,10 +1,11 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as store from '../src/store.js';
 import type { IncomingMessage } from '../src/types.js';
+import { DEFAULT_SETTINGS } from '../src/types.js';
 
 let tmp: string;
 
@@ -128,7 +129,13 @@ test('store: registerGroup is idempotent (same chatId overwrites)', () => {
 test('store: registerGroup handles chatId change for same folder', () => {
   store.registerGroup({ chatId: 'old-chat', name: 'Main', folder: 'main-switch', trigger: '' });
   assert.ok(store.getGroupByChatId('old-chat'));
-  store.registerGroup({ chatId: 'new-chat', name: 'Main', folder: 'main-switch', trigger: '' });
+  assert.throws(() => {
+    store.registerGroup({ chatId: 'new-chat', name: 'Main', folder: 'main-switch', trigger: '' });
+  }, /already registered/);
+  store.registerGroup(
+    { chatId: 'new-chat', name: 'Main', folder: 'main-switch', trigger: '' },
+    { allowFolderTakeover: true },
+  );
   assert.equal(store.getGroupByChatId('old-chat'), undefined);
   assert.ok(store.getGroupByChatId('new-chat'));
   assert.equal(store.getGroupByChatId('new-chat')!.folder, 'main-switch');
@@ -186,6 +193,16 @@ test('store: addSchedule + getScheduleByTask roundtrip', () => {
   assert.equal(found!.status, 'active');
 });
 
+test('store: getScheduleById returns active and completed rows', () => {
+  const id = store.addSchedule({
+    groupFolder: 'main', chatId: '1', task: 'by id', scheduleType: 'once',
+    scheduleValue: new Date().toISOString(), contextMode: 'isolated',
+    nextRun: new Date().toISOString(), status: 'active', recurring: false, system: false,
+  });
+  assert.equal(store.getScheduleById(id)?.id, id);
+  store.updateSchedule(id, { status: 'completed' });
+  assert.equal(store.getScheduleById(id)?.status, 'completed');
+});
 test('store: updateSchedule changes status', () => {
   const id = store.addSchedule({
     groupFolder: 'main', chatId: 'sched2', task: 'pause-me-task',
@@ -292,4 +309,65 @@ test('store: setKv overwrites previous value', () => {
   store.setKv('overwrite-key', 'old');
   store.setKv('overwrite-key', 'new');
   assert.equal(store.getKv('overwrite-key'), 'new');
+});
+
+
+// --- Regression coverage: sequence cursor, settings healing, audit recency ---
+
+test('store: getMessagesAfterRow is oldest-first and sequence survives pruning', () => {
+  const chat = `cursor-${Date.now()}`;
+  const t = Date.now();
+  for (let i = 0; i < 3; i++) {
+    store.saveMessage(msg({ id: `${chat}-${i}`, chatId: chat, text: `m${i}`, timestamp: t + i }));
+  }
+  const first = store.getMessagesAfterRow(chat, 0, 2);
+  assert.equal(first.length, 2);
+  assert.equal(first[0]!.content, 'm0');
+  assert.equal(first[1]!.content, 'm1');
+  const cursor = first[first.length - 1]!.rowId;
+
+  // Delete the highest row (the shape of retention pruning) and verify a new
+  // message still gets a higher sequence than the persisted cursor.
+  const last = store.getMessagesAfterRow(chat, cursor, 10).at(-1)!;
+  store.saveMessage(msg({ id: `${chat}-old`, chatId: chat, text: 'old', timestamp: Date.now() - 40 * 24 * 3600_000 }));
+  store.pruneOldData(30);
+  store.saveMessage(msg({ id: `${chat}-new`, chatId: chat, text: 'new', timestamp: Date.now() }));
+  const after = store.getMessagesAfterRow(chat, Math.max(cursor, last.rowId), 10);
+  assert.equal(after.length, 1);
+  assert.equal(after[0]!.content, 'new');
+  assert.ok(after[0]!.rowId > cursor);
+});
+
+test('store: loadSettings repairs invalid fields and preserves valid ones', () => {
+  store.saveSettings({ ...DEFAULT_SETTINGS, assistantName: 'Keeper', allowedSenders: ['1'] });
+  const path = join(tmp, 'settings.json');
+  writeFileSync(path, JSON.stringify({ assistantName: 'Keeper', model: 'bogus', rateLimitMax: 0 }));
+  const loaded = store.loadSettings();
+  assert.equal(loaded.assistantName, 'Keeper');
+  assert.equal(loaded.model, DEFAULT_SETTINGS.model);
+  assert.equal(loaded.rateLimitMax, DEFAULT_SETTINGS.rateLimitMax);
+  const healed = JSON.parse(readFileSync(path, 'utf-8'));
+  assert.equal(healed.model, DEFAULT_SETTINGS.model);
+  assert.equal(healed.rateLimitMax, DEFAULT_SETTINGS.rateLimitMax);
+  store.saveSettings(DEFAULT_SETTINGS);
+});
+
+test('store: settings symlink is refused', () => {
+  const path = join(tmp, 'settings.json');
+  const target = join(tmp, 'settings-real.json');
+  writeFileSync(target, JSON.stringify(DEFAULT_SETTINGS));
+  rmSync(path, { force: true });
+  symlinkSync(target, path);
+  const loaded = store.loadSettings();
+  assert.equal(loaded.assistantName, DEFAULT_SETTINGS.assistantName);
+  rmSync(path, { force: true });
+  symlinkSync(target, path); // still a symlink; remove before the next test writes settings
+  rmSync(path, { force: true });
+  store.saveSettings(DEFAULT_SETTINGS);
+});
+
+test('store: hasRecentAuditEvent uses SQLite timestamp format', () => {
+  store.logAudit('recent_marker', 'now');
+  assert.equal(store.hasRecentAuditEvent('recent_marker', 60_000), true);
+  assert.equal(store.hasRecentAuditEvent('never_logged_marker', 60_000), false);
 });

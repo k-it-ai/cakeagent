@@ -3,6 +3,9 @@ dist/
 data/
 credentials/
 .env
+.mcp.json
 .tsbuildinfo
+whisper.cpp/
 groups/*/conversations/
 .DS_Store
+coverage/

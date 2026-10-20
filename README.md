@@ -7,11 +7,11 @@
 [![Build](https://github.com/kossov-it/cakeagent/actions/workflows/build.yml/badge.svg)](https://github.com/kossov-it/cakeagent/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A personal AI agent you can actually read — around 3,300 lines of code, 9 files, and 3 runtime dependencies.
+A personal AI agent you can actually read — around 5,300 lines of TypeScript across 12 source files and 3 runtime dependencies.
 
-CakeAgent connects Claude to Telegram and gives it tools, voice, scheduling, file access, web search, and code execution. New capabilities come from two ecosystems: **MCP** (runtime tool servers) and **skills.sh** (knowledge-driven CLI integrations). Ask "add Google Calendar" in chat and it installs itself.
+CakeAgent connects Claude to Telegram and gives it tools, voice, scheduling, file access, web fetch, and code execution. New capabilities come from two ecosystems: **MCP** (runtime tool servers) and **skills.sh** (knowledge-driven CLI integrations). Ask "add Google Calendar" in chat and it installs itself.
 
-Runs as a single Node.js process under a dedicated system user. No containers, no web UI, no open ports.
+Runs as a single Node.js 22+ process under a dedicated system user. No containers, no web UI, no open ports.
 
 ---
 
@@ -19,23 +19,23 @@ Runs as a single Node.js process under a dedicated system user. No containers, n
 
 Open-source AI assistants have a bloat problem. The popular ones ship 400K+ lines of code, 50+ dependencies, WebSocket control planes, and custom plugin marketplaces — then get hit with critical RCE vulnerabilities and tens of thousands of exposed instances. Their plugin ecosystems? Some have been found to leak credentials.
 
-CakeAgent does almost nothing itself and lets the ecosystem do the rest. The entire codebase is ~3,300 lines across 9 files. Integrations come from two open ecosystems — MCP (thousands of tool servers) and skills.sh (CLI knowledge packs). No custom plugin format, no marketplace.
+CakeAgent does almost nothing itself and lets the ecosystem do the rest. The entire codebase is ~5,300 lines across 12 files. Integrations come from two open ecosystems — MCP (thousands of tool servers) and skills.sh (CLI knowledge packs). No custom plugin format, no marketplace.
 
 | | CakeAgent | Popular alternatives |
 |---|---|---|
-| **Source code** | ~3,300 LOC, 9 files | 400K+ LOC, 50+ modules |
+| **Source code** | ~5,300 LOC, ~12 files | 400K+ LOC, 50+ modules |
 | **Dependencies** | 3 | 47+ direct |
 | **Open ports** | 0 | WebSocket, HTTP API |
-| **Telegram** | 277 LOC raw `fetch()` | Framework + adapter |
+| **Telegram** | ~400 LOC raw `fetch()` | Framework + adapter |
 | **Integrations** | MCP + skills.sh | Custom plugin marketplace |
-| **Security** | 5-layer defense, ~90 deny patterns, every tool call audited | Varies — some have critical RCEs |
+| **Security** | 9 hook groups + systemd watchdog + structured logging, ~125 deny patterns, every tool call audited | Varies — some have critical RCEs |
 | **CVEs** | 0 | Multiple critical RCEs |
 
 ---
 
 ## Install
 
-Linux server with Node.js 18+ required.
+Linux server with Node.js 22+ required.
 
 **Quick install:**
 
@@ -101,7 +101,7 @@ Removes the systemd service, the `cakeagent` user, the sudoers entry, and `/opt/
        │              Tool Layer                   │
        │                                           │
        │  ┌─────────────┐ ┌───────────┐ ┌───────┐  │
-       │  │  19 Built-in│ │ External  │ │Skills │  │
+       │  │  23 Built-in│ │ External  │ │Skills │  │
        │  │  MCP Tools  │ │ MCP (.mcp)│ │(.sh)  │  │
        │  └─────────────┘ └───────────┘ └───────┘  │
        └───────────────────────────────────────────┘
@@ -129,13 +129,13 @@ Responses are streamed as the agent works. Intermediate text (thinking, progress
 
 The agent has persistent memory in `data/memory.md`, injected into every prompt automatically. When you say "remember that..." or "from now on...", the agent writes to memory. Memory survives restarts and `/reset`.
 
-Three system tasks run automatically (configurable via settings, disable by setting cron to empty string):
+Two system tasks run automatically (configurable via settings, disable by setting cron to empty string):
 
 | Task | Default schedule | What it does |
 |------|-----------------|-------------|
 | **Morning check-in** | 8:57am daily | Reviews memory and scheduled tasks, sends a brief daily summary |
 | **Dream** | 3:23am daily | Consolidates memory — removes outdated entries, merges duplicates, fixes contradictions |
-| **Memory extraction** | Every 5 conversations | Reviews recent messages, saves new facts/preferences to memory silently |
+
 
 Scheduling uses standard 5-field cron expressions (`minute hour day month weekday`). Missed tasks are recovered on restart — one-shot tasks fire, recurring tasks silently advance.
 
@@ -173,11 +173,13 @@ CakeAgent:  Installed. Available now.
 | `send_message` / `send_file` | Send progress updates or files mid-conversation |
 | `schedule_task` / `list_schedules` / `update_schedule` / `delete_schedule` | Task scheduling with cron expressions (e.g. `0 9 * * 1-5` = weekdays at 9am) |
 | `search_mcp_registry` | Search the official MCP registry |
+| `web_fetch` | Fetch HTTPS pages/APIs with SSRF protection |
 | `install_tool` / `remove_tool` / `list_tools` | Manage MCP servers |
-| `install_skill` / `remove_skill` / `list_skills` | Manage skills.sh integrations |
-| `get_settings` / `update_settings` | Read or change settings |
-| `register_group` / `list_groups` | Manage Telegram group chats |
+| `install_skill` / `remove_skill` / `list_skills` / `read_skill` | Manage skills.sh integrations |
+| `get_settings` / `update_settings` | Read or change settings (main only) |
+| `register_group` / `list_groups` | Manage Telegram group chats (main only) |
 | `update_memory` / `rewrite_memory` | Persistent memory across sessions |
+| `search_messages` / `list_audit_events` | Full-text message search (FTS5) and security audit review |
 
 ---
 
@@ -187,11 +189,12 @@ CakeAgent gives Claude real system access — it installs packages, manages serv
 
 | Layer | What it does |
 |-------|-------------|
-| **OS sandbox** | Dedicated `cakeagent` user (nologin shell), systemd `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true` |
+| **OS sandbox** | Dedicated `cakeagent` user (nologin shell), systemd `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `WatchdogSec=60` (Type=notify) |
 | **Sudoers** | Passwordless sudo limited to `apt-get`, `apt`, `dpkg`, `systemctl`, `nft`, `iptables`, `ip6tables`, `ufw`, `firewall-cmd`, `fail2ban-client`, `netfilter-persistent`, and `setup.sh` only — destructive verbs still blocked by the bash hook |
-| **PreToolUse hooks** | 5 hooks validate every Bash, Read, Grep, Glob, Write, and Edit call before execution. ~90 Bash deny patterns cover shell injection, reverse shells, inline execution, destructive ops, secret access, critical system files, firewall mutations, source code writes, Unicode whitespace injection, control characters, IFS manipulation, process substitution, and zsh dangerous builtins. Commands are normalized (quotes stripped) before pattern matching. |
+| **PreToolUse hooks** | 9 hook groups validate every Bash, Read, Grep, Glob, Write, Edit, MultiEdit, NotebookEdit, and WebFetch call. ~125 Bash deny patterns cover shell injection, reverse shells, inline execution, destructive ops, secret access, critical system files, firewall mutations, source code writes, Unicode whitespace injection, control characters, IFS manipulation, process substitution, and zsh dangerous builtins. Commands are normalized (quotes/backslashes stripped, newlines folded) before pattern matching. |
 | **Agent controls** | `acceptEdits` permission mode, `maxTurns: 25`, sender allowlist, rate limiting |
 | **Runtime checks** | Prompt injection detection, memory/skill content sanitization, startup permission auto-fix (`.env`, `data/`, `.mcp.json`, `credentials/`) |
+| **Structured logging** | JSON lines to stdout/stderr (`log.info/warn/error({fields}, message)`); `LOG_LEVEL` env var; secrets auto-redacted |
 
 Additional hooks: **SubagentStart** logs all subagent launches to audit. **PreCompact** archives conversations on context compaction.
 

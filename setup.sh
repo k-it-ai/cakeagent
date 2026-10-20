@@ -2,26 +2,80 @@
 set -euo pipefail
 
 # For interactive install (curl | bash), redirect stdin from tty
-# Skip for non-interactive modes (update, uninstall, install-config, remove-config, certbot, harden-sshd)
+# Skip for non-interactive modes (update, uninstall, install-config, remove-config, certbot, harden-sshd,
+# systemctl, apt, apt-get, nft, iptables, ip6tables, ufw, firewall-cmd, fail2ban-client, netfilter-persistent)
 if [ "${1:-}" != "update" ] && [ "${1:-}" != "uninstall" ] && \
    [ "${1:-}" != "install-config" ] && [ "${1:-}" != "remove-config" ] && \
    [ "${1:-}" != "certbot" ] && [ "${1:-}" != "harden-sshd" ] && \
+   [ "${1:-}" != "systemctl" ] && [ "${1:-}" != "apt" ] && [ "${1:-}" != "apt-get" ] && \
+   [ "${1:-}" != "nft" ] && [ "${1:-}" != "iptables" ] && [ "${1:-}" != "ip6tables" ] && \
+   [ "${1:-}" != "ufw" ] && [ "${1:-}" != "firewall-cmd" ] && \
+   [ "${1:-}" != "fail2ban-client" ] && [ "${1:-}" != "netfilter-persistent" ] && \
    [ ! -t 0 ] && [ -e /dev/tty ]; then
   exec </dev/tty
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must run as root (use: sudo bash setup.sh)." >&2
+  exit 1
 fi
 
 INSTALL_DIR="/opt/cakeagent"
 SERVICE_USER="cakeagent"
 SERVICE_NAME="cakeagent"
+HELPER_DIR="/usr/local/lib/cakeagent"
+HELPER="$HELPER_DIR/setup.sh"
+BASH_BIN="$(command -v bash || echo /usr/bin/bash)"
+
+# The agent may invoke only these setup.sh subcommands through sudo. In
+# particular it may not run `update` or `uninstall`: those mutate the
+# installation and are human/root operations.
+write_sudoers() {
+  local file="/etc/sudoers.d/$SERVICE_NAME"
+  cat <<SUDOERS > "$file"
+$SERVICE_USER ALL=(ALL) NOPASSWD: \\
+  $BASH_BIN $HELPER install-config *, \\
+  $BASH_BIN $HELPER remove-config *, \\
+  $BASH_BIN $HELPER certbot *, \\
+  $BASH_BIN $HELPER harden-sshd, \\
+  $BASH_BIN $HELPER systemctl *, \\
+  $BASH_BIN $HELPER apt *, \\
+  $BASH_BIN $HELPER apt-get *, \\
+  $BASH_BIN $HELPER nft *, \\
+  $BASH_BIN $HELPER iptables *, \\
+  $BASH_BIN $HELPER ip6tables *, \\
+  $BASH_BIN $HELPER ufw *, \\
+  $BASH_BIN $HELPER firewall-cmd *, \\
+  $BASH_BIN $HELPER fail2ban-client *, \\
+  $BASH_BIN $HELPER netfilter-persistent *
+Defaults:$SERVICE_USER !requiretty
+Defaults:$SERVICE_USER env_keep += "DEBIAN_FRONTEND"
+SUDOERS
+  chmod 440 "$file"
+  if ! visudo -cf "$file" >/dev/null 2>&1; then
+    echo "   ❌ Sudoers syntax error — removing broken file"
+    rm -f "$file"
+    return 1
+  fi
+}
+
+# Install the root-owned helper copy. The repository itself is owned by the
+# service user, so pointing sudoers at /opt/cakeagent/setup.sh would let a
+# compromised agent edit the helper and then execute it as root.
+install_helper() {
+  install -d -m 0755 "$HELPER_DIR"
+  install -m 0755 -o root -g root "$INSTALL_DIR/setup.sh" "$HELPER"
+}
 
 # --- Shared: validate a target path for install-config / remove-config ---
 # Writes error to stderr and returns 1 on failure, 0 on success.
 validate_config_path() {
   local target="$1"
 
-  # Reject empty, relative, and paths containing traversal components
+  # Reject empty, relative, whitespace/control characters, and paths containing
+  # traversal components.
   case "$target" in
-    ''|*' '*) echo "Denied: invalid path" >&2; return 1 ;;
+    ''|*[[:space:]]*) echo "Denied: invalid path" >&2; return 1 ;;
     /*) ;;
     *) echo "Denied: path must be absolute" >&2; return 1 ;;
   esac
@@ -53,7 +107,7 @@ validate_config_path() {
     /etc/nginx/sites-available/*|/etc/nginx/sites-enabled/*|\
     /etc/nginx/conf.d/*|/etc/nginx/snippets/*|/etc/nginx/modules-available/*|\
     /etc/apache2/sites-available/*|/etc/apache2/sites-enabled/*|/etc/apache2/conf-available/*|\
-    /etc/caddy/*|/etc/caddy/Caddyfile|\
+    /etc/caddy/*|\
     /etc/systemd/system/*.service|/etc/systemd/system/*.timer|/etc/systemd/system/*.socket|\
     /etc/systemd/system/*.path|/etc/systemd/system/*.mount|/etc/systemd/system/*.target|\
     /etc/systemd/system/*.conf.d/*.conf|\
@@ -88,7 +142,10 @@ validate_config_path() {
 #   sudo bash setup.sh install-config <target> <source-file>    # copy from source
 # The file-input form lets agents avoid embedding nginx-style `{...;...}` in
 # shell commands (the bash hook treats those as brace groups). Write the
-# content with the Write tool first, then install it.
+# content with the Write tool first, then install it. Sources must be in the
+# agent-writable data/tmp/ (or the service's private /tmp) so the helper cannot
+# copy settings.json, memory, the database, or conversation archives into a
+# world-readable /etc file.
 if [ "${1:-}" = "install-config" ]; then
   TARGET="${2:-}"
   SOURCE="${3:-}"
@@ -97,25 +154,49 @@ if [ "${1:-}" = "install-config" ]; then
   fi
   # Reject directory-shaped targets (trailing slash, no filename).
   case "$TARGET" in */) echo "Denied: target must be a file, not a directory: $TARGET" >&2; exit 1 ;; esac
+  SOURCE_FD=""
   if [ -n "$SOURCE" ]; then
-    case "$SOURCE" in
-      /opt/cakeagent/data/*|/tmp/*) ;;
-      *) echo "Denied: source must be under /opt/cakeagent/data/ or /tmp/: $SOURCE" >&2; exit 1 ;;
-    esac
     case "$SOURCE" in *..*) echo "Denied: path traversal in source: $SOURCE" >&2; exit 1 ;; esac
     if [ ! -f "$SOURCE" ]; then
       echo "Source file not found: $SOURCE" >&2
       exit 1
     fi
+    # Open first, then verify the opened descriptor rather than re-reading a
+    # path that a same-user process could swap for a symlink to .env. This
+    # closes the realpath/read TOCTOU window.
+    exec {SOURCE_FD}< "$SOURCE"
+    SOURCE_REAL=$(readlink -f "/proc/self/fd/$SOURCE_FD")
+    case "$SOURCE_REAL" in
+      "$INSTALL_DIR"/data/tmp/*|/tmp/*) ;;
+      *) echo "Denied: source resolves outside $INSTALL_DIR/data/tmp/ or /tmp/: $SOURCE_REAL" >&2; exit 1 ;;
+    esac
+    if [ ! -f "/proc/self/fd/$SOURCE_FD" ]; then
+      echo "Denied: source is not a regular file: $SOURCE_REAL" >&2
+      exit 1
+    fi
   fi
   PARENT="$(dirname "$TARGET")"
   mkdir -p "$PARENT"
+  # Validate the resolved target as well: a symlinked parent (for example a
+  # sites-enabled symlink pointing at /etc/ssh) must not redirect this write.
+  TARGET_REAL="$(readlink -f -- "$TARGET" 2>/dev/null || true)"
+  if [ -n "$TARGET_REAL" ] && [ "$TARGET_REAL" != "$TARGET" ]; then
+    if ! validate_config_path "$TARGET_REAL"; then
+      echo "Denied: target resolves to a disallowed path: $TARGET_REAL" >&2
+      exit 1
+    fi
+  fi
   TMP="$(mktemp "${TARGET}.XXXXXX.tmp")"
   trap 'rm -f "$TMP"' EXIT
-  if [ -n "$SOURCE" ]; then
-    head -c $((1024 * 1024)) < "$SOURCE" > "$TMP"
+  if [ -n "$SOURCE_FD" ]; then
+    head -c $((1024 * 1024 + 1)) <&"$SOURCE_FD" > "$TMP"
+    exec {SOURCE_FD}<&-
   else
-    head -c $((1024 * 1024)) > "$TMP"
+    head -c $((1024 * 1024 + 1)) > "$TMP"
+  fi
+  if [ "$(wc -c < "$TMP")" -gt $((1024 * 1024)) ]; then
+    echo "Denied: config content exceeds the 1 MiB limit" >&2
+    exit 1
   fi
   chmod 0644 "$TMP"
   mv "$TMP" "$TARGET"
@@ -139,13 +220,20 @@ if [ "${1:-}" = "remove-config" ]; then
     echo "Denied: only regular files may be removed: $TARGET" >&2
     exit 1
   fi
+  TARGET_REAL="$(readlink -f -- "$TARGET" 2>/dev/null || true)"
+  if [ -n "$TARGET_REAL" ] && [ "$TARGET_REAL" != "$TARGET" ]; then
+    if ! validate_config_path "$TARGET_REAL"; then
+      echo "Denied: target resolves to a disallowed path: $TARGET_REAL" >&2
+      exit 1
+    fi
+  fi
   rm -f "$TARGET"
   echo "Removed $TARGET"
   exit 0
 fi
 
 # --- certbot: wrap certbot with dangerous flags stripped ---
-# Sudoers already allows `bash setup.sh *`, inheriting root.
+# Sudoers allows only the root-owned helper's certbot subcommand, inheriting root.
 # Hook flags (--pre-hook, --post-hook, --deploy-hook, --renew-hook,
 # --manual-auth-hook, --manual-cleanup-hook) are denied because they exec
 # arbitrary commands as root. Instead, drop scripts into
@@ -165,11 +253,13 @@ if [ "${1:-}" = "certbot" ]; then
         echo "Denied: ${arg%%=*} — use /etc/letsencrypt/renewal-hooks/{pre,deploy,post}/ via install-config instead" >&2
         exit 1
         ;;
-      --config|--config-dir|--work-dir|--logs-dir)
+      -c|--config|--config-dir|--work-dir|--logs-dir|--cert-path|--key-path|--chain-path|--fullchain-path|--csr|\
+      --nginx-ctl|--nginx-server-root|--apache-ctl|--apache-bin|--apache-server-root)
         echo "Denied: $arg — path redirection not allowed (certbot must use default /etc/letsencrypt layout)" >&2
         exit 1
         ;;
-      --config=*|--config-dir=*|--work-dir=*|--logs-dir=*)
+      -c=*|-c/*|--config=*|--config-dir=*|--work-dir=*|--logs-dir=*|--cert-path=*|--key-path=*|--chain-path=*|--fullchain-path=*|--csr=*|\
+      --nginx-ctl=*|--nginx-server-root=*|--apache-ctl=*|--apache-bin=*|--apache-server-root=*)
         echo "Denied: ${arg%%=*} — path redirection not allowed" >&2
         exit 1
         ;;
@@ -201,6 +291,27 @@ if [ "${1:-}" = "harden-sshd" ]; then
     cp -a "$DROPIN" "$BACKUP"
   fi
   mkdir -p /etc/ssh/sshd_config.d
+
+  # Check for at least one authorized_keys file before disabling password auth.
+  # This prevents locking out password-only users. We check all users' home
+  # directories and root.
+  has_authorized_keys=0
+  for homedir in /root /home/*; do
+    if [ -f "$homedir/.ssh/authorized_keys" ] && [ -s "$homedir/.ssh/authorized_keys" ]; then
+      has_authorized_keys=1
+      break
+    fi
+  done
+  # Also check for any user with SSH keys in /etc/ssh/authorized_keys (centralized)
+  if [ "$has_authorized_keys" -eq 0 ] && [ -f /etc/ssh/authorized_keys ] && [ -s /etc/ssh/authorized_keys ]; then
+    has_authorized_keys=1
+  fi
+  if [ "$has_authorized_keys" -eq 0 ]; then
+    echo "Error: No authorized_keys found for any user. Refusing to disable PasswordAuthentication." >&2
+    echo "At least one user must have ~/.ssh/authorized_keys with content before hardening." >&2
+    exit 1
+  fi
+
   TMP="$(mktemp "${DROPIN}.XXXXXX.tmp")"
   trap 'rm -f "$TMP"; [ -n "$BACKUP" ] && rm -f "$BACKUP"' EXIT
   cat > "$TMP" <<'HARDENING'
@@ -248,12 +359,17 @@ fi
 if [ "${1:-}" = "update" ]; then
   echo "🍰 Updating CakeAgent..."
   cd "$INSTALL_DIR"
+  if [ -n "$(sudo -u "$SERVICE_USER" git status --porcelain --untracked-files=no)" ]; then
+    echo "   ❌ Working tree has local changes — commit or stash them first." >&2
+    exit 1
+  fi
   BEFORE=$(sudo -u "$SERVICE_USER" git rev-parse HEAD)
-  sudo -u "$SERVICE_USER" git pull
-  AFTER=$(sudo -u "$SERVICE_USER" git rev-parse HEAD)
   NODE_DIR=$(dirname "$(command -v node)")
+  NODE_BIN=$(command -v node)
+  sudo -u "$SERVICE_USER" git pull --ff-only
+  AFTER=$(sudo -u "$SERVICE_USER" git rev-parse HEAD)
   if [ "$BEFORE" != "$AFTER" ]; then
-    if ! sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && npm run build"; then
+    if ! sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && npm ci --no-fund --no-audit && npm run build"; then
       echo "   ❌ Build failed — rolling back to previous version"
       sudo -u "$SERVICE_USER" git reset --hard "$BEFORE"
       exit 1
@@ -261,25 +377,18 @@ if [ "${1:-}" = "update" ]; then
   else
     echo "   No changes."
   fi
-  # Refresh sudoers + service file (skip if /etc is read-only, e.g. inside systemd sandbox)
+  # Refresh the root-owned helper, sudoers, and service file. Skip if /etc is
+  # read-only (e.g. invoked from inside the systemd sandbox).
   if touch /etc/sudoers.d/.writetest 2>/dev/null; then
     rm -f /etc/sudoers.d/.writetest
-    SUDOERS_FILE="/etc/sudoers.d/$SERVICE_NAME"
-    cat <<SUDOERS > "$SUDOERS_FILE"
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg, /usr/bin/systemctl, /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/bin/fail2ban-client, /usr/sbin/netfilter-persistent, /usr/bin/bash $INSTALL_DIR/setup.sh *
-Defaults:$SERVICE_USER !requiretty
-Defaults:$SERVICE_USER env_keep += "DEBIAN_FRONTEND"
-SUDOERS
-    chmod 440 "$SUDOERS_FILE"
-    if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
-      echo "   ❌ Sudoers syntax error — removing broken file"
-      rm -f "$SUDOERS_FILE"
-    fi
+    install_helper
     sed -e "s|/opt/cakeagent|${INSTALL_DIR}|g" \
+        -e "s|^ExecStart=/usr/bin/node |ExecStart=${NODE_BIN} |" \
         -e "s|User=cakeagent|User=${SERVICE_USER}|g" \
         -e "s|Group=cakeagent|Group=${SERVICE_USER}|g" \
         -e "/\[Service\]/a Environment=PATH=${NODE_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         "$INSTALL_DIR/cakeagent.service" > "/etc/systemd/system/${SERVICE_NAME}.service"
+    write_sudoers || exit 1
     systemctl daemon-reload
   fi
   if [ "$BEFORE" != "$AFTER" ]; then
@@ -300,7 +409,7 @@ if [ "${1:-}" = "uninstall" ]; then
   echo "   - Delete $INSTALL_DIR (code, data, config, everything)"
   echo "   - Delete system user '$SERVICE_USER' and its home"
   echo "   - Remove sudoers entry"
-  echo "   - Remove any packages the agent installed (ffmpeg, edge-tts)"
+  echo "   - Remove any packages the agent installed (ffmpeg, whisper.cpp, Python venv)"
   echo ""
   read -rp "   Type 'yes' to confirm: " CONFIRM
   if [ "$CONFIRM" != "yes" ]; then
@@ -317,7 +426,8 @@ if [ "${1:-}" = "uninstall" ]; then
   echo "   ✅ Service removed"
 
   sudo rm -f "/etc/sudoers.d/$SERVICE_NAME"
-  echo "   ✅ Sudoers entry removed"
+  sudo rm -rf "$HELPER_DIR"
+  echo "   ✅ Sudoers entry and root helper removed"
 
   if id "$SERVICE_USER" &>/dev/null; then
     sudo userdel "$SERVICE_USER" 2>/dev/null || true
@@ -332,6 +442,297 @@ if [ "${1:-}" = "uninstall" ]; then
   exit 0
 fi
 
+# --- systemctl: safe service management wrapper ---
+# Only allows specific verbs on non-critical units. Blocks stop/restart/disable/mask
+# on ssh/sshd/networking and any operation on cakeagent itself.
+if [ "${1:-}" = "systemctl" ]; then
+  shift
+  VERB="${1:-}"
+  UNIT="${2:-}"
+
+  # Always allow these read-only verbs
+  case "$VERB" in
+    status|is-active|is-enabled|is-failed|list-units|list-unit-files|daemon-reload)
+      systemctl "$VERB" "$UNIT"
+      exit $?
+      ;;
+  esac
+
+  # Block all operations on cakeagent unit (no self-management)
+  case "$UNIT" in
+    cakeagent*|"$SERVICE_NAME"*)
+      echo "Denied: operations on cakeagent unit are not allowed" >&2
+      exit 1
+      ;;
+  esac
+
+  # Block destructive verbs on critical units
+  case "$VERB" in
+    stop|restart|disable|enable|mask|unmask|kill)
+      case "$UNIT" in
+        ssh|sshd|sshd.service|ssh.socket|sshd.socket|networking|networking.service)
+          echo "Denied: $VERB on critical unit $UNIT" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+  esac
+
+  # Allow other verbs (start, reload, etc.) on non-critical units
+  case "$VERB" in
+    start|reload|enable|disable|mask|unmask|restart|stop|kill)
+      systemctl "$VERB" "$UNIT"
+      exit $?
+      ;;
+    *)
+      echo "Denied: unknown systemctl verb: $VERB" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# --- apt: safe package management wrapper ---
+# Allows install, update, upgrade. Blocks remove/purge of critical packages.
+if [ "${1:-}" = "apt" ] || [ "${1:-}" = "apt-get" ]; then
+  shift
+  VERB="${1:-}"
+
+  # Allow read-only verbs
+  case "$VERB" in
+    update|list|search|show|policy|autoclean|autoremove)
+      apt "$VERB" "$@"
+      exit $?
+      ;;
+  esac
+
+  # Allow install/upgrade with package validation
+  case "$VERB" in
+    install|upgrade|full-upgrade|dist-upgrade)
+      shift
+      for pkg in "$@"; do
+        # Block removal of critical packages via install of conflicting packages
+        case "$pkg" in
+          *cakeagent*|*sshd*|*openssh-server*|*sudo*|*systemd*|*libc6*|*grub*|*kernel*|*linux-image*)
+            echo "Denied: installing/upgrading critical package: $pkg" >&2
+            exit 1
+            ;;
+        esac
+      done
+      DEBIAN_FRONTEND=noninteractive apt "$VERB" -y "$@"
+      exit $?
+      ;;
+    remove|purge|autoremove)
+      # Block removal of critical packages
+      shift
+      for pkg in "$@"; do
+        case "$pkg" in
+          *cakeagent*|*sshd*|*openssh-server*|*sudo*|*systemd*|*libc6*|*grub*|*kernel*|*linux-image*)
+            echo "Denied: removing critical package: $pkg" >&2
+            exit 1
+            ;;
+        esac
+      done
+      DEBIAN_FRONTEND=noninteractive apt "$VERB" -y "$@"
+      exit $?
+      ;;
+    *)
+      echo "Denied: unknown apt verb: $VERB" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# --- nft: safe nftables wrapper ---
+# Allows rule/chain/set add/delete/list. Blocks flush/delete table.
+if [ "${1:-}" = "nft" ]; then
+  shift
+  # Check for destructive operations
+  for arg in "$@"; do
+    case "$arg" in
+      flush|delete)
+        # Next arg determines what's being flushed/deleted
+        ;;
+    esac
+  done
+  # Simple deny-list for destructive verbs at top level
+  case "$1" in
+    flush)
+      echo "Denied: nft flush not allowed (use delete rule/chain/set instead)" >&2
+      exit 1
+      ;;
+    delete)
+      # Allow delete rule/chain/set, but not delete table
+      if [ "${2:-}" = "table" ]; then
+        echo "Denied: nft delete table not allowed" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  nft "$@"
+  exit $?
+fi
+
+# --- iptables / ip6tables: safe wrapper ---
+# Blocks -F/-X/-Z (flush/delete/zero) and -P ACCEPT (default accept policy)
+if [ "${1:-}" = "iptables" ] || [ "${1:-}" = "ip6tables" ]; then
+  CMD="${1}"
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      -F|-X|-Z)
+        echo "Denied: $CMD $arg (flush/delete/zero not allowed)" >&2
+        exit 1
+        ;;
+      -P)
+        # Next arg is chain, then policy - check for ACCEPT
+        ;;
+    esac
+  done
+  # Check for -P ... ACCEPT pattern
+  for i in $(seq 1 $#); do
+    if [ "${!i}" = "-P" ]; then
+      next=$((i + 1))
+      if [ "${!next:-}" = "ACCEPT" ]; then
+        echo "Denied: $CMD -P ... ACCEPT (default accept policy not allowed)" >&2
+        exit 1
+      fi
+    fi
+  done
+  # Block rules touching port 22
+  for arg in "$@"; do
+    case "$arg" in
+      *22*)
+        # Could be --dport 22, --sport 22, etc.
+        if [[ "$arg" =~ (dport|sport|port)[[:space:]]*22\b ]]; then
+          echo "Denied: $CMD rule touching port 22" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+  "$CMD" "$@"
+  exit $?
+fi
+
+# --- ufw: safe wrapper ---
+# Allows rule management, status, reload. Blocks reset, disable, default allow, port 22 rules.
+if [ "${1:-}" = "ufw" ]; then
+  shift
+  VERB="${1:-}"
+  # Handle multi-word verbs first
+  case "$VERB $2" in
+    "status verbose"|"status numbered"|"app list"|"app info"|"app update")
+      # Read-only - allow
+      ufw "$VERB" "$2" "$3"
+      exit $?
+      ;;
+  esac
+  case "$VERB" in
+    status|show|reload)
+      ufw "$VERB" "$@"
+      exit $?
+      ;;
+    enable|disable|reset)
+      echo "Denied: ufw $VERB not allowed" >&2
+      exit 1
+      ;;
+    allow|deny|limit|reject|delete|route|insert)
+      # Check for port 22 in args
+      for arg in "$@"; do
+        if [[ "$arg" =~ ^22(/tcp)?$ ]] || [[ "$arg" =~ ^22(/udp)?$ ]]; then
+          echo "Denied: ufw rule on port 22" >&2
+          exit 1
+        fi
+      done
+      # Check for "default allow"
+      if [ "$VERB" = "default" ] && [ "${2:-}" = "allow" ]; then
+        echo "Denied: ufw default allow not allowed" >&2
+        exit 1
+      fi
+      ufw "$VERB" "$@"
+      exit $?
+      ;;
+    default)
+      if [ "${2:-}" = "allow" ]; then
+        echo "Denied: ufw default allow not allowed" >&2
+        exit 1
+      fi
+      ufw "$VERB" "$@"
+      exit $?
+      ;;
+    *)
+      echo "Denied: unknown ufw verb: $VERB" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# --- firewall-cmd: safe wrapper ---
+# Allows zone/port/service management. Blocks panic-on, remove-service=ssh, remove-port=22, set-default-zone=trusted.
+if [ "${1:-}" = "firewall-cmd" ]; then
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      --panic-on|--remove-service=ssh|--remove-port=22*|--set-default-zone=trusted)
+        echo "Denied: firewall-cmd $arg" >&2
+        exit 1
+        ;;
+    esac
+  done
+  firewall-cmd "$@"
+  exit $?
+fi
+
+# --- fail2ban-client: safe wrapper ---
+# Allows status, set, get, unban <ip>, reload. Blocks stop, unban --all.
+if [ "${1:-}" = "fail2ban-client" ]; then
+  shift
+  VERB="${1:-}"
+  case "$VERB" in
+    stop)
+      echo "Denied: fail2ban-client stop not allowed" >&2
+      exit 1
+      ;;
+    unban)
+      if [ "${2:-}" = "--all" ]; then
+        echo "Denied: fail2ban-client unban --all not allowed" >&2
+        exit 1
+      fi
+      fail2ban-client "$VERB" "$@"
+      exit $?
+      ;;
+    status|set|get|reload)
+      fail2ban-client "$VERB" "$@"
+      exit $?
+      ;;
+    *)
+      echo "Denied: unknown fail2ban-client verb: $VERB" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# --- netfilter-persistent: safe wrapper ---
+# Allows save, reload. Blocks flush.
+if [ "${1:-}" = "netfilter-persistent" ]; then
+  shift
+  VERB="${1:-}"
+  case "$VERB" in
+    flush)
+      echo "Denied: netfilter-persistent flush not allowed" >&2
+      exit 1
+      ;;
+    save|reload)
+      netfilter-persistent "$VERB"
+      exit $?
+      ;;
+    *)
+      echo "Denied: unknown netfilter-persistent verb: $VERB" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 # --- Install ---
 
 echo "🍰 CakeAgent Setup"
@@ -341,12 +742,12 @@ echo ""
 echo "1️⃣  Checking prerequisites..."
 
 if ! command -v node &>/dev/null; then
-  echo "   ❌ Node.js 18+ required. Install: https://nodejs.org"
+  echo "   ❌ Node.js 22+ required (better-sqlite3 uses Node 22 APIs). Install: https://nodejs.org"
   exit 1
 fi
 NODE_VER=$(node -v | sed 's/v//' | cut -d. -f1)
-if [ "$NODE_VER" -lt 18 ]; then
-  echo "   ❌ Node.js 18+ required (found $(node -v))"
+if [ "$NODE_VER" -lt 22 ]; then
+  echo "   ❌ Node.js 22+ required (found $(node -v))"
   exit 1
 fi
 echo "   ✅ Node.js $(node -v)"
@@ -375,13 +776,10 @@ fi
 echo ""
 echo "4️⃣  Installing dependencies..."
 
-NODE_BIN=$(command -v node)
 NPM_BIN=$(command -v npm)
-NPX_BIN=$(command -v npx)
-NODE_DIR=$(dirname "$NODE_BIN")
+NODE_DIR=$(dirname "$(command -v node)")
 
-sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && cd '$INSTALL_DIR' && '$NPM_BIN' install --no-fund --no-audit 2>&1" | tail -3
-sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && cd '$INSTALL_DIR' && '$NPM_BIN' i edge-tts --no-fund --no-audit 2>/dev/null" || true
+sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && cd '$INSTALL_DIR' && '$NPM_BIN' ci --no-fund --no-audit 2>&1" | tail -3
 echo "   Building..."
 sudo -u "$SERVICE_USER" bash -c "export PATH='$NODE_DIR':\$PATH && cd '$INSTALL_DIR' && '$NPM_BIN' run build" || {
   echo "   ❌ Build failed"
@@ -392,19 +790,9 @@ echo "   ✅ Built"
 echo ""
 echo "5️⃣  Configuring agent permissions..."
 
-SUDOERS_FILE="/etc/sudoers.d/$SERVICE_NAME"
-cat <<SUDOERS | sudo tee "$SUDOERS_FILE" > /dev/null
-$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg, /usr/bin/systemctl, /usr/sbin/nft, /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/bin/fail2ban-client, /usr/sbin/netfilter-persistent, /usr/bin/bash $INSTALL_DIR/setup.sh *
-Defaults:$SERVICE_USER !requiretty
-Defaults:$SERVICE_USER env_keep += "DEBIAN_FRONTEND"
-SUDOERS
-sudo chmod 440 "$SUDOERS_FILE"
-if ! sudo visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
-  echo "   ❌ Sudoers syntax error — removing broken file"
-  sudo rm -f "$SUDOERS_FILE"
-  exit 1
-fi
-echo "   ✅ Agent can install system packages"
+install_helper
+write_sudoers || exit 1
+echo "   ✅ Agent can install system packages with a scoped sudo policy"
 
 sudo -u "$SERVICE_USER" mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/groups/main" "$INSTALL_DIR/credentials"
 
@@ -416,10 +804,15 @@ echo "6️⃣  Telegram bot setup:"
 echo ""
 echo "   → Create a bot: https://t.me/BotFather (send /newbot)"
 echo ""
-read -rp "   Bot token: " BOT_TOKEN
+read -rsp "   Bot token: " BOT_TOKEN
+echo ""
 
 if [ -z "$BOT_TOKEN" ]; then
   echo "   ❌ Required"
+  exit 1
+fi
+if ! [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+  echo "   ❌ Invalid bot token format"
   exit 1
 fi
 
@@ -440,6 +833,10 @@ read -rp "   Your Telegram user ID: " CHAT_ID
 
 if [ -z "$CHAT_ID" ]; then
   echo "   ❌ Required"
+  exit 1
+fi
+if ! [[ "$CHAT_ID" =~ ^-?[0-9]+$ ]]; then
+  echo "   ❌ Invalid Telegram chat ID"
   exit 1
 fi
 
@@ -464,7 +861,8 @@ if [ "$AUTH_CHOICE" = "2" ]; then
   echo "   → https://console.anthropic.com/settings/keys"
   echo "   → Click 'Create Key', copy the sk-ant-api... value"
   echo ""
-  read -rp "   API key: " AUTH_KEY
+  read -rsp "   API key: " AUTH_KEY
+echo ""
   AUTH_VAR="ANTHROPIC_API_KEY"
 else
   echo ""
@@ -475,12 +873,16 @@ else
   echo ""
   echo "   Copy the sk-ant-oat... token it displays and paste below."
   echo ""
-  read -rp "   Subscription token: " AUTH_KEY
+  read -rsp "   Subscription token: " AUTH_KEY
+echo ""
   AUTH_VAR="CLAUDE_CODE_OAUTH_TOKEN"
 fi
 
 if [ -z "$AUTH_KEY" ]; then
   echo "   ⚠️  No auth provided. Add it to $INSTALL_DIR/.env before starting."
+elif ! [[ "$AUTH_KEY" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+  echo "   ❌ Invalid auth key format"
+  exit 1
 else
   if [ ${#AUTH_KEY} -gt 14 ]; then
     MASKED="${AUTH_KEY:0:10}$(printf '*%.0s' $(seq 1 $((${#AUTH_KEY} - 14))))${AUTH_KEY: -4}"
@@ -499,7 +901,7 @@ ENV_FILE="$INSTALL_DIR/.env"
   fi
 } | sudo tee "$ENV_FILE" > /dev/null
 
-sudo chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"
+sudo chown root:root "$ENV_FILE"
 sudo chmod 600 "$ENV_FILE"
 echo ""
 echo "   ✅ Configuration saved"
@@ -508,7 +910,9 @@ echo ""
 echo "8️⃣  Starting service..."
 
 NODE_PATH_DIR=$(dirname "$(command -v node)")
+NODE_BIN=$(command -v node)
 sed -e "s|/opt/cakeagent|${INSTALL_DIR}|g" \
+    -e "s|^ExecStart=/usr/bin/node |ExecStart=${NODE_BIN} |" \
     -e "s|User=cakeagent|User=${SERVICE_USER}|g" \
     -e "s|Group=cakeagent|Group=${SERVICE_USER}|g" \
     -e "/\[Service\]/a Environment=PATH=${NODE_PATH_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \

@@ -1,8 +1,14 @@
 import Database from 'better-sqlite3';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, lstatSync, openSync, fstatSync, closeSync, constants } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage, RegisteredGroup, ScheduledTask, CakeSettings } from './types.js';
-import { DEFAULT_SETTINGS, redactSecrets } from './types.js';
+import {
+  CakeSettingsSchema, DEFAULT_SETTINGS, normalizeSettings, redactSecrets,
+  MAX_SKILL_BYTES, MAX_MEMORY_BYTES,
+} from './types.js';
+import { isPathInside, canonicalPath } from './security.js';
+import { log } from './logger.js';
 
 let db: Database.Database;
 let dataDir: string;
@@ -21,9 +27,11 @@ export function initDb(dir: string): void {
       sender_name TEXT,
       content TEXT,
       timestamp INTEGER NOT NULL,
-      is_group INTEGER DEFAULT 0
+      is_group INTEGER DEFAULT 0,
+      seq INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_msg_chat_seq ON messages(chat_id, seq);
 
     CREATE TABLE IF NOT EXISTS schedules (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,16 +77,57 @@ export function initDb(dir: string): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- Monotonic message sequence. SQLite reuses rowids after the highest row is
+    -- deleted (for example by retention pruning), which would make a persisted
+    -- rowid cursor skip every new message. This table is never pruned, so its
+    -- AUTOINCREMENT values remain strictly increasing.
+    CREATE TABLE IF NOT EXISTS message_seq (
+      id INTEGER PRIMARY KEY AUTOINCREMENT
+    );
   `);
 
-  // Migrations: add columns for cron scheduling
+  // Migrations: add columns for cron scheduling / stable system-task identity
   const migrations = [
     `ALTER TABLE schedules ADD COLUMN recurring INTEGER DEFAULT 1`,
     `ALTER TABLE schedules ADD COLUMN system INTEGER DEFAULT 0`,
+    `ALTER TABLE schedules ADD COLUMN system_key TEXT`,
+    `ALTER TABLE messages ADD COLUMN seq INTEGER`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
   }
+
+  // Backfill seq in insertion order for databases created before it existed,
+  // then advance message_seq past the highest assigned value. Existing
+  // chat_cursor KV values were rowids, which equal the backfilled seq values.
+  db.exec(`UPDATE messages SET seq = rowid WHERE seq IS NULL`);
+  const maxSeq = (db.prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM messages`).get() as { n: number }).n;
+  const seqState = db.prepare(`SELECT seq FROM sqlite_sequence WHERE name = 'message_seq'`).get() as { seq: number } | undefined;
+  if ((seqState && maxSeq > seqState.seq) || (!seqState && maxSeq > 0)) {
+    db.prepare(`INSERT INTO message_seq (id) VALUES (?)`).run(maxSeq);
+  }
+
+  // A previous crash or manual edit must not make startup fail on the unique
+  // system-key index. Keep the preferred row (active first, newest id).
+  const duplicateKeys = db.prepare(
+    `SELECT system_key FROM schedules WHERE system_key IS NOT NULL
+     GROUP BY system_key HAVING COUNT(*) > 1`,
+  ).all() as Array<{ system_key: string }>;
+  for (const { system_key } of duplicateKeys) {
+    const rows = db.prepare(
+      `${SCHEDULE_SELECT} WHERE system_key = ?
+       ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, id DESC`,
+    ).all(system_key) as ScheduledTask[];
+    for (const row of rows.slice(1)) db.prepare(`DELETE FROM schedules WHERE id = ?`).run(row.id);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sched_due ON schedules(status, next_run);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sched_system_key
+      ON schedules(system_key) WHERE system_key IS NOT NULL;
+  `);
 
   // FTS5 virtual table for message search. Unindexed columns keep them queryable
   // for filtering without tokenising. Triggers keep it in sync automatically.
@@ -119,7 +168,7 @@ export function initDb(dir: string): void {
         SELECT content, sender_name, chat_id, timestamp, id FROM messages`);
     }
   } catch (err) {
-    console.warn('[store] FTS5 unavailable, search will use LIKE fallback:', (err as Error).message);
+    log.warn({ context: 'store', err: (err as Error).message }, 'FTS5 unavailable, search will use LIKE fallback');
     ftsAvailable = false;
   }
 }
@@ -130,26 +179,76 @@ export function hasFts(): boolean { return ftsAvailable; }
 // --- Messages ---
 
 export function saveMessage(msg: IncomingMessage, content?: string): void {
+  const existing = db.prepare(`SELECT seq FROM messages WHERE id = ?`).get(msg.id) as { seq: number } | undefined;
+  if (existing) {
+    // A message may be updated after it was first stored (e.g. reply context
+    // enrichment). Keep its original sequence so conversation order survives.
+    db.prepare(`UPDATE messages SET content = ? WHERE id = ?`).run(content ?? msg.text ?? '', msg.id);
+    return;
+  }
+  const seq = Number(db.prepare(`INSERT INTO message_seq DEFAULT VALUES`).run().lastInsertRowid);
   db.prepare(
-    `INSERT INTO messages (id, chat_id, sender_id, sender_name, content, timestamp, is_group)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET content = excluded.content`
-  ).run(msg.id, msg.chatId, msg.senderId, msg.senderName, content ?? msg.text ?? '', msg.timestamp, msg.isGroup ? 1 : 0);
+    `INSERT INTO messages (id, chat_id, sender_id, sender_name, content, timestamp, is_group, seq)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(msg.id, msg.chatId, msg.senderId, msg.senderName, content ?? msg.text ?? '', msg.timestamp, msg.isGroup ? 1 : 0, seq);
 }
 
 export function saveOutgoing(chatId: string, content: string, timestamp: number): void {
   const id = `out_${timestamp}_${Math.random().toString(36).slice(2, 8)}`;
+  const seq = Number(db.prepare(`INSERT INTO message_seq DEFAULT VALUES`).run().lastInsertRowid);
   db.prepare(
-    `INSERT OR IGNORE INTO messages (id, chat_id, sender_id, sender_name, content, timestamp, is_group)
-     VALUES (?, ?, 'assistant', 'assistant', ?, ?, 0)`
-  ).run(id, chatId, content, timestamp);
+    `INSERT OR IGNORE INTO messages (id, chat_id, sender_id, sender_name, content, timestamp, is_group, seq)
+     VALUES (?, ?, 'assistant', 'assistant', ?, ?, 0, ?)`
+  ).run(id, chatId, content, timestamp, seq);
 }
 
-export function getMessagesSince(chatId: string, since: number, limit = 50): Array<{ sender_name: string; content: string; timestamp: number }> {
+export interface StoredMessage {
+  rowId: number;
+  sender_name: string;
+  content: string;
+  timestamp: number;
+}
+
+// `rowId` is the monotonic message_seq value, not SQLite's reusable rowid.
+// Assistant output is excluded by default: the SDK session already contains
+// it, and replaying it as a user-role message corrupts the next prompt.
+// Startup/history variant: return the oldest rows in the window so a large
+// backlog drains in order instead of skipping its beginning.
+export function getMessagesSinceAsc(
+  chatId: string,
+  since: number,
+  limit = 50,
+  includeAssistant = false,
+): StoredMessage[] {
   return db.prepare(
-    `SELECT sender_name, content, timestamp FROM messages
-     WHERE chat_id = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT ?`
-  ).all(chatId, since, limit) as Array<{ sender_name: string; content: string; timestamp: number }>;
+    `SELECT seq as rowId, sender_name, content, timestamp FROM messages
+     WHERE chat_id = ? AND timestamp >= ? ${includeAssistant ? '' : "AND COALESCE(sender_id, '') != 'assistant'"}
+     ORDER BY seq ASC LIMIT ?`
+  ).all(chatId, since, limit) as StoredMessage[];
+}
+
+export function getMessagesSince(
+  chatId: string,
+  since: number,
+  limit = 50,
+  includeAssistant = false,
+): StoredMessage[] {
+  const assistantClause = includeAssistant ? '' : ` AND COALESCE(sender_id, '') != 'assistant'`;
+  return db.prepare(
+    `SELECT seq as rowId, sender_name, content, timestamp FROM messages
+     WHERE chat_id = ? AND timestamp > ?${assistantClause}
+     ORDER BY seq DESC LIMIT ?`
+  ).all(chatId, since, limit) as StoredMessage[];
+}
+
+// Returns the *oldest* unseen rows first so a burst larger than `limit` is
+// drained in order instead of jumping the cursor over the middle of the burst.
+export function getMessagesAfterRow(chatId: string, rowId: number, limit = 50): StoredMessage[] {
+  return db.prepare(
+    `SELECT seq as rowId, sender_name, content, timestamp FROM messages
+     WHERE chat_id = ? AND seq > ? AND COALESCE(sender_id, '') != 'assistant'
+     ORDER BY seq ASC LIMIT ?`
+  ).all(chatId, rowId, limit) as StoredMessage[];
 }
 
 // Full-text search across stored messages. Uses FTS5 if available, falls back
@@ -162,11 +261,13 @@ export function searchMessages(
   const since = opts.since ?? 0;
 
   if (ftsAvailable) {
-    // FTS5 MATCH — sanitize to prevent MATCH syntax errors on arbitrary input.
-    // Wrap terms in quotes; collapse to phrase query for safety.
-    const safe = query.replace(/["']/g, ' ').trim();
-    if (!safe) return [];
-    const matchExpr = `"${safe}"`;
+    // FTS5 MATCH — split into words, quote each term, and AND them together.
+    // This avoids MATCH syntax errors while giving predictable "all words"
+    // semantics (an exact phrase query would be surprising for multi-word
+    // searches and differs from the LIKE fallback).
+    const terms = query.replace(/["']/g, ' ').trim().split(/\s+/).filter(Boolean).slice(0, 20);
+    if (terms.length === 0) return [];
+    const matchExpr = terms.map(t => `"${t}"`).join(' AND ');
     const where: string[] = [`messages_fts MATCH ?`];
     const vals: unknown[] = [matchExpr];
     if (opts.chatId) { where.push(`chat_id = ?`); vals.push(opts.chatId); }
@@ -181,22 +282,46 @@ export function searchMessages(
     }
   }
 
-  const where: string[] = [`content LIKE ?`];
-  const vals: unknown[] = [`%${query.replace(/[%_\\]/g, '\\$&')}%`];
+  const terms = query.trim().split(/\s+/).filter(Boolean).slice(0, 20);
+  if (terms.length === 0) return [];
+  const where: string[] = terms.map(() => `content LIKE ? ESCAPE '\\'`);
+  const vals: unknown[] = terms.map(t => `%${t.replace(/[%_\\]/g, '\\$&')}%`);
   if (opts.chatId) { where.push(`chat_id = ?`); vals.push(opts.chatId); }
   if (since > 0) { where.push(`timestamp > ?`); vals.push(since); }
   return db.prepare(
     `SELECT content, sender_name, chat_id, timestamp FROM messages
-     WHERE ${where.join(' AND ')} ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?`
+     WHERE ${where.join(' AND ')} ORDER BY timestamp DESC LIMIT ?`
   ).all(...vals, limit) as Array<{ sender_name: string; content: string; timestamp: number; chat_id: string }>;
 }
 
 // --- Groups ---
 
-export function registerGroup(group: RegisteredGroup): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO groups (chat_id, name, folder, trigger_word) VALUES (?, ?, ?, ?)`
-  ).run(group.chatId, group.name, group.folder, group.trigger);
+// Registering a chat is idempotent. Folder takeover is explicit: without
+// `allowFolderTakeover`, a different chat cannot claim an existing folder.
+// Startup passes the flag for the configured main chat; the agent-facing tool
+// does not, which prevents a prompt-injected `register_group` call from
+// hijacking another chat's folder (and therefore its files/context).
+export function registerGroup(
+  group: RegisteredGroup,
+  opts: { allowFolderTakeover?: boolean } = {},
+): void {
+  const byFolder = db.prepare(`SELECT chat_id FROM groups WHERE folder = ?`).get(group.folder) as
+    { chat_id: string } | undefined;
+
+  const apply = db.transaction(() => {
+    if (byFolder && byFolder.chat_id !== group.chatId) {
+      if (!opts.allowFolderTakeover) {
+        throw new Error(`Folder "${group.folder}" is already registered to another chat.`);
+      }
+      db.prepare(`DELETE FROM groups WHERE folder = ?`).run(group.folder);
+    }
+    db.prepare(
+      `INSERT INTO groups (chat_id, name, folder, trigger_word) VALUES (?, ?, ?, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET
+         name = excluded.name, folder = excluded.folder, trigger_word = excluded.trigger_word`
+    ).run(group.chatId, group.name, group.folder, group.trigger);
+  });
+  apply();
 }
 
 export function getGroups(): RegisteredGroup[] {
@@ -222,9 +347,13 @@ export function setSession(groupFolder: string, sessionId: string): void {
 
 export function addSchedule(task: Omit<ScheduledTask, 'id' | 'lastRun' | 'lastError' | 'createdAt'>): number {
   const result = db.prepare(
-    `INSERT INTO schedules (group_folder, chat_id, task, schedule_type, schedule_value, context_mode, next_run, status, recurring, system)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(task.groupFolder, task.chatId, task.task, task.scheduleType, task.scheduleValue, task.contextMode, task.nextRun, task.status, task.recurring ? 1 : 0, task.system ? 1 : 0);
+    `INSERT INTO schedules (group_folder, chat_id, task, schedule_type, schedule_value, context_mode, next_run, status, recurring, system, system_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    task.groupFolder, task.chatId, task.task, task.scheduleType, task.scheduleValue,
+    task.contextMode, task.nextRun, task.status, task.recurring ? 1 : 0,
+    task.system ? 1 : 0, task.systemKey ?? null,
+  );
   return Number(result.lastInsertRowid);
 }
 
@@ -232,6 +361,7 @@ const SCHEDULE_SELECT = `SELECT id, group_folder as groupFolder, chat_id as chat
   schedule_type as scheduleType, schedule_value as scheduleValue,
   context_mode as contextMode, next_run as nextRun, status,
   COALESCE(recurring, 1) as recurring, COALESCE(system, 0) as system,
+  system_key as systemKey,
   last_run as lastRun, last_error as lastError, created_at as createdAt
   FROM schedules`;
 
@@ -247,6 +377,7 @@ const SCHEDULE_COLUMNS: Record<string, string> = {
   task: 'task', scheduleType: 'schedule_type', scheduleValue: 'schedule_value',
   contextMode: 'context_mode', nextRun: 'next_run', status: 'status',
   lastRun: 'last_run', lastError: 'last_error', recurring: 'recurring', system: 'system',
+  systemKey: 'system_key',
 };
 
 export function updateSchedule(id: number, fields: Partial<ScheduledTask>): void {
@@ -275,6 +406,22 @@ export function getScheduleByTask(taskDescription: string): ScheduledTask | unde
   return db.prepare(`${SCHEDULE_SELECT} WHERE task = ? AND status = 'active' LIMIT 1`).get(taskDescription) as ScheduledTask | undefined;
 }
 
+export function getScheduleByTaskAnyStatus(taskDescription: string): ScheduledTask | undefined {
+  return db.prepare(
+    `${SCHEDULE_SELECT} WHERE task = ?
+     ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, id DESC
+     LIMIT 1`,
+  ).get(taskDescription) as ScheduledTask | undefined;
+}
+
+export function getScheduleBySystemKey(systemKey: string): ScheduledTask | undefined {
+  return db.prepare(`${SCHEDULE_SELECT} WHERE system_key = ? LIMIT 1`).get(systemKey) as ScheduledTask | undefined;
+}
+
+export function getScheduleById(id: number): ScheduledTask | undefined {
+  return db.prepare(`${SCHEDULE_SELECT} WHERE id = ? LIMIT 1`).get(id) as ScheduledTask | undefined;
+}
+
 // --- Rate Limits ---
 
 export function checkRateLimit(key: string, max: number, windowMs: number): boolean {
@@ -299,13 +446,19 @@ export function logAudit(event: string, detail?: string): void {
   db.prepare(`INSERT INTO audit_log (event, detail) VALUES (?, ?)`).run(event, safeDetail);
 }
 
+function toSqlTimestamp(value: string): string {
+  // audit_log.created_at is stored by SQLite as "YYYY-MM-DD HH:MM:SS" (UTC).
+  // Accept ISO timestamps from callers and compare in the same format.
+  return value.includes('T') ? value.slice(0, 19).replace('T', ' ') : value;
+}
+
 export function listAuditEvents(opts: { event?: string; since?: string; limit?: number } = {}):
   Array<{ id: number; event: string; detail: string | null; created_at: string }> {
   const limit = Math.min(Math.max(1, opts.limit ?? 50), 500);
   const where: string[] = [];
   const vals: unknown[] = [];
   if (opts.event) { where.push(`event = ?`); vals.push(opts.event); }
-  if (opts.since) { where.push(`created_at > ?`); vals.push(opts.since); }
+  if (opts.since) { where.push(`created_at > ?`); vals.push(toSqlTimestamp(opts.since)); }
   const sql = `SELECT id, event, detail, created_at FROM audit_log
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY id DESC LIMIT ?`;
@@ -321,28 +474,44 @@ export function loadSettings(): CakeSettings {
     return { ...DEFAULT_SETTINGS };
   }
   try {
-    const raw = JSON.parse(readFileSync(path, 'utf-8'));
-    // Migrate legacy single `voice` toggle → split toggles
-    if ('voice' in raw && !('voiceReceive' in raw)) {
-      raw.voiceReceive = raw.voice;
-      raw.voiceSend = raw.voice;
-      delete raw.voice;
+    if (lstatSync(path).isSymbolicLink()) {
+      log.error({ context: 'store', path }, 'settings.json is a symlink — refusing to read it');
+      return { ...DEFAULT_SETTINGS };
     }
-    return { ...DEFAULT_SETTINGS, ...raw };
+    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    const { settings, issues } = normalizeSettings(raw);
+    if (issues.length > 0) {
+      log.warn({ context: 'store', issues }, 'settings.json contained invalid values — repaired');
+      // Heal the file so the warning doesn't repeat on every invocation.
+      writeAtomic(path, JSON.stringify(settings, null, 2));
+    }
+    return settings;
   } catch (err) {
-    console.error('[store] settings.json is corrupt — using defaults:', (err as Error).message);
+    log.error({ context: 'store', err: (err as Error).message }, 'settings.json is corrupt — using defaults');
     return { ...DEFAULT_SETTINGS };
   }
 }
 
-function writeAtomic(filePath: string, data: string): void {
-  const tmp = filePath + '.tmp';
-  writeFileSync(tmp, data);
-  renameSync(tmp, filePath);
+export function writeAtomic(filePath: string, data: string, mode = 0o600): void {
+  // Use an unpredictable exclusive path. A predictable `.tmp` name lets the
+  // agent place a symlink there, causing a later settings/index write to
+  // overwrite a file of its choosing.
+  const tmp = `${filePath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tmp, data, { mode, flag: 'wx' });
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  }
 }
 
 export function saveSettings(settings: CakeSettings): void {
-  writeAtomic(join(dataDir, 'settings.json'), JSON.stringify(settings, null, 2));
+  const parsed = CakeSettingsSchema.safeParse(settings);
+  if (!parsed.success) {
+    throw new Error(`Refusing to save invalid settings: ${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  }
+  writeAtomic(join(dataDir, 'settings.json'), JSON.stringify(parsed.data, null, 2));
 }
 
 // --- Pruning ---
@@ -352,6 +521,9 @@ export function pruneOldData(retentionDays = 30): void {
   db.prepare(`DELETE FROM messages WHERE timestamp < ?`).run(cutoff);
   db.prepare(`DELETE FROM audit_log WHERE created_at < datetime('now', ? || ' days')`).run(-retentionDays);
   db.prepare(`DELETE FROM rate_limits WHERE window_start < ?`).run(cutoff);
+  // Keep the sequence table bounded. sqlite_sequence retains the high-water
+  // mark, so pruning old rows cannot make ids get reused.
+  db.prepare(`DELETE FROM message_seq WHERE id < (SELECT COALESCE(MAX(id), 0) - 1000 FROM message_seq)`).run();
 }
 
 export function countActiveSchedules(): number {
@@ -379,9 +551,33 @@ export function loadSkillIndex(): Record<string, SkillMeta> {
   const path = join(dataDir, 'skills', 'index.json');
   if (!existsSync(path)) return {};
   try {
-    return JSON.parse(readFileSync(path, 'utf-8'));
+    if (lstatSync(path).isSymbolicLink()) {
+      log.error({ context: 'store', path }, 'skills/index.json is a symlink — refusing to read it');
+      return {};
+    }
+    const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const out: Record<string, SkillMeta> = Object.create(null) as Record<string, SkillMeta>;
+    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!/^[a-zA-Z0-9_-]{1,100}$/.test(name)) continue;
+      if (['__proto__', 'prototype', 'constructor'].includes(name)) continue;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const meta = value as Record<string, unknown>;
+      if (typeof meta.owner !== 'string' || typeof meta.repo !== 'string' ||
+          typeof meta.skill !== 'string' || typeof meta.installedAt !== 'string') continue;
+      out[name] = {
+        owner: meta.owner,
+        repo: meta.repo,
+        skill: meta.skill,
+        installedAt: meta.installedAt,
+        ...(typeof meta.sha === 'string' ? { sha: meta.sha } : {}),
+        ...(typeof meta.ref === 'string' ? { ref: meta.ref } : {}),
+        ...(typeof meta.summary === 'string' ? { summary: meta.summary } : {}),
+      };
+    }
+    return out;
   } catch (err) {
-    console.error('[store] skills/index.json is corrupt — treating as empty:', (err as Error).message);
+    log.error({ context: 'store', err: (err as Error).message }, 'skills/index.json is corrupt — treating as empty');
     return {};
   }
 }
@@ -403,17 +599,41 @@ export function loadSkillSummaries(): string {
   if (names.length === 0) return '';
   const lines = names.map(name => {
     const meta = index[name]!;
-    const summary = meta.summary?.trim() || '(no description)';
+    const summary = (meta.summary?.trim() || '(no description)').replace(/[\r\n]+/g, ' ');
     return `- ${name} — ${summary.slice(0, 140)}`;
   });
   return `Installed skills (call read_skill(name) for full body):\n${lines.join('\n')}`;
 }
 
 export function readSkill(name: string): string | null {
-  if (/[./\\]/.test(name)) return null;
-  const mdPath = join(dataDir, 'skills', `${name}.md`);
-  if (!existsSync(mdPath)) return null;
-  return readFileSync(mdPath, 'utf-8');
+  if (!/^[a-zA-Z0-9_-]{1,100}$/.test(name)) return null;
+  const skillsDir = resolveSkillsDir();
+  const mdPath = join(skillsDir, `${name}.md`);
+  const real = canonicalPath(mdPath);
+  // A symlink inside skills/ must not turn read_skill into an arbitrary-file
+  // reader (and host-side edits are possible even if the agent cannot write).
+  // O_NOFOLLOW also closes the race where the path is swapped to a symlink
+  // after canonicalPath ran.
+  if (!isPathInside(skillsDir, real) || !existsSync(real)) return null;
+  let fd: number;
+  try {
+    fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    return null;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_SKILL_BYTES) return null;
+    return readFileSync(fd, 'utf-8');
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function resolveSkillsDir(): string {
+  return canonicalPath(join(dataDir, 'skills'));
 }
 
 // --- Key-Value ---
@@ -430,14 +650,19 @@ export function setKv(key: string, value: string): void {
 // --- Audit Helpers ---
 
 export function hasRecentAuditEvent(event: string, sinceMs: number): boolean {
-  const cutoff = new Date(Date.now() - sinceMs).toISOString();
-  const row = db.prepare(`SELECT 1 FROM audit_log WHERE event = ? AND created_at > ? LIMIT 1`).get(event, cutoff);
+  // SQLite's datetime('now') uses "YYYY-MM-DD HH:MM:SS", not ISO "…T…Z".
+  // Comparing against toISOString() made recent events invisible for the whole
+  // window (the string always sorted below the stored timestamp). Timestamps
+  // have one-second precision, so use >= to avoid losing an event that landed
+  // in the same second as the cutoff.
+  const cutoff = new Date(Date.now() - sinceMs).toISOString().slice(0, 19).replace('T', ' ');
+  const row = db.prepare(`SELECT 1 FROM audit_log WHERE event = ? AND created_at >= ? LIMIT 1`).get(event, cutoff);
   return !!row;
 }
 
 // --- Cleanup ---
 
-export const MAX_MEMORY_SIZE = 50 * 1024; // 50 KB
+export const MAX_MEMORY_SIZE = MAX_MEMORY_BYTES;
 
 export function closeDb(): void {
   db?.close();
