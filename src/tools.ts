@@ -246,18 +246,28 @@ async function readLimitedText(res: Response, maxBytes = MAX_FETCH_BYTES): Promi
 }
 
 function htmlToText(html: string): string {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
+  // Single-pass, non-backtracking HTML-to-text to avoid ReDoS and double-decoding.
+  // Order: strip scripts/styles → strip tags → decode entities (once, longest-first).
+  let text = html;
+  // Remove <script>...</script> and <style>...</style> blocks
+  text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ');
+  text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+  // Remove remaining tags
+  text = text.replace(/<[^>]+>/g, ' ');
+  // Decode entities — longest first to avoid double-decoding (e.g., &lt; → < → <)
+  const entities: [RegExp, string][] = [
+    [/&/gi, '&'],
+    [/</gi, '<'],
+    [/>/gi, '>'],
+    [/"/gi, '"'],
+    [/'/g, "'"],
+    [/&nbsp;/gi, ' '],
+  ];
+  for (const [re, repl] of entities) {
+    text = text.replace(re, repl);
+  }
+  // Collapse whitespace
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 function memoryWriteError(memPath: string): string | null {
